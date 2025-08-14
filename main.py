@@ -229,7 +229,7 @@ def analyze_opportunity(opportunity: dict, semaphore: threading.Semaphore) -> tu
             'funder': enrichment_data.get('funder'),
             'deadline': parsed_deadline_str,
             'raw_deadline_text': raw_deadline_text,
-            'focus_areas': ", ".join(enrichment_data.get('focus_areas', [])),
+            'focus_areas': ', '.join(enrichment_data.get('focus_areas', [])),
             'summary': enrichment_data.get('summary')
         }
 
