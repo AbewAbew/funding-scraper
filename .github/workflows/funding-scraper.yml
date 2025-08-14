@@ -21,6 +21,12 @@ jobs:
       run: |
         pip install -r requirements-minimal.txt
     
+    - name: Setup proxy
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y tor
+        sudo service tor start
+    
     - name: Run scraper
       env:
         GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
