@@ -61,6 +61,15 @@ def create_retry_session(
     """
     session = session or requests.Session()
     
+    # Check if running in GitHub Actions and use Tor proxy
+    if os.getenv('GITHUB_ACTIONS'):
+        proxies = {
+            'http': 'socks5://127.0.0.1:9050',
+            'https': 'socks5://127.0.0.1:9050'
+        }
+        session.proxies.update(proxies)
+        logger.info("GitHub Actions detected: Using Tor proxy for requests.")
+    
     # Define the retry strategy using urllib3's Retry class
     retry_strategy = Retry(
         total=retries,
