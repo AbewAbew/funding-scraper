@@ -123,7 +123,9 @@ def scrape_od(existing_links: set) -> list[dict]:
     logger.info("--- Starting Scraper: Opportunity Desk ---")
     
     session = create_retry_session(use_proxy=True)  # OD scraper uses proxy
-    session.headers.update(HEADERS)
+    # Don't override headers when using proxy
+    if not session.proxies:
+        session.headers.update(HEADERS)
     
     all_recent_links = get_opportunity_links(session)
     logger.info(f"OD: Found {len(all_recent_links)} recently published opportunities based on the date cutoff.")
