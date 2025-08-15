@@ -41,6 +41,7 @@ def create_retry_session(
     backoff_factor=0.5,
     status_forcelist=(500, 502, 503, 504),
     session=None,
+    use_proxy=False,
 ):
     """
     Creates a requests.Session with a robust, configurable retry strategy.
