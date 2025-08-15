@@ -61,14 +61,18 @@ def create_retry_session(
     """
     session = session or requests.Session()
     
-    # Check if running in GitHub Actions and use Tor proxy
+    # Check if running in GitHub Actions and add better headers
     if os.getenv('GITHUB_ACTIONS'):
-        proxies = {
-            'http': 'socks5://127.0.0.1:9050',
-            'https': 'socks5://127.0.0.1:9050'
-        }
-        session.proxies.update(proxies)
-        logger.info("GitHub Actions detected: Using Tor proxy for requests.")
+        # Add realistic browser headers to avoid blocking
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        })
+        logger.info("GitHub Actions detected: Using enhanced browser headers.")
     
     # Define the retry strategy using urllib3's Retry class
     retry_strategy = Retry(
