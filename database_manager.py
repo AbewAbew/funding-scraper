@@ -1,214 +1,122 @@
-# database_manager.py (Corrected and Updated for Bulk Operations)
+"""All Supabase access. Requires the tables and functions from sql/schema.sql."""
 import logging
+import os
 from datetime import datetime, timezone
-from dateutil.relativedelta import relativedelta
-from utils import init_supabase_client
-from postgrest.exceptions import APIError
+from functools import lru_cache
+
+from postgrest.types import ReturnMethod
+
+import config  # noqa: F401  (loads .env)
 
 logger = logging.getLogger(__name__)
 
-# Initialize the Supabase client once when the module is loaded
-supabase = init_supabase_client()
+PAGE_SIZE = 1000  # PostgREST's default max rows per request
 
-def add_raw_opportunities(opportunities: list):
+
+class DatabaseUnavailable(RuntimeError):
+    pass
+
+
+def resolve_backend_key() -> str | None:
     """
-    Adds a list of raw scraped opportunities to the 'raw_opportunities' table.
-    Uses upsert to avoid errors on duplicate links, effectively performing an
-    "INSERT IGNORE" operation.
+    Prefer the new secret key (sb_secret_...). Fall back to the legacy service_role JWT,
+    which Supabase deprecates at the end of 2026, so both work during the migration.
     """
-    if not supabase:
-        logger.error("Supabase client not initialized. Cannot add raw opportunities.")
+    key = os.getenv("SUPABASE_SECRET_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
+    if not key:
+        return None
+    key = key.strip()
+    if key.startswith("sb_publishable_"):
+        raise DatabaseUnavailable("A publishable key was supplied; the pipeline needs the secret key (sb_secret_...)")
+    if key.startswith("sb_secret_"):
+        logger.info("Supabase: using secret API key")
+    else:
+        logger.warning("Supabase: using the legacy service_role key (deprecated end of 2026). "
+                       "Set SUPABASE_SECRET_KEY to an sb_secret_... key.")
+    return key
+
+
+def resolve_url() -> str | None:
+    """Accept the project URL with or without the '/rest/v1' suffix the dashboard sometimes shows."""
+    url = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
+    for suffix in ("/rest/v1", "/rest"):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)]
+    return url or None
+
+
+@lru_cache(maxsize=1)
+def client():
+    url, key = resolve_url(), resolve_backend_key()
+    if not (url and key):
+        raise DatabaseUnavailable("SUPABASE_URL and SUPABASE_SECRET_KEY (or legacy SUPABASE_SERVICE_KEY) must be set")
+    from supabase import create_client
+
+    return create_client(url, key)
+
+
+def _paginate(build_query) -> list[dict]:
+    rows, start = [], 0
+    while True:
+        batch = build_query().range(start, start + PAGE_SIZE - 1).execute().data or []
+        rows.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            return rows
+        start += PAGE_SIZE
+
+
+def check_connection() -> dict:
+    """Read-only connectivity check: counts rows in both tables."""
+    counts = {}
+    for table in ("raw_opportunities", "processed_opportunities"):
+        counts[table] = client().table(table).select("link", count="exact").limit(1).execute().count
+    return counts
+
+
+# --- Maintenance -----------------------------------------------------------
+def run_maintenance(stale_months: int, raw_text_days: int, article_cutoff_months: int) -> dict:
+    """Server-side cleanup (see sql function `run_maintenance`). Returns counts per action."""
+    result = client().rpc("run_maintenance", {
+        "stale_months": stale_months,
+        "raw_text_days": raw_text_days,
+        "pending_cutoff_months": article_cutoff_months,
+    }).execute()
+    return result.data or {}
+
+
+# --- Raw queue -------------------------------------------------------------
+def get_all_scraped_links() -> set[str]:
+    rows = _paginate(lambda: client().table("raw_opportunities").select("link").order("link"))
+    return {r["link"] for r in rows}
+
+
+def add_raw_opportunities(records: list[dict]) -> int:
+    if not records:
         return 0
+    for i in range(0, len(records), 200):
+        chunk = records[i:i + 200]
+        client().table("raw_opportunities").upsert(
+            chunk, on_conflict="link", ignore_duplicates=True, returning=ReturnMethod.minimal
+        ).execute()
+    return len(records)
 
-    if not opportunities:
-        logger.info("No raw opportunities to add.")
-        return 0
 
-    try:
-        response = supabase.table('raw_opportunities').upsert(opportunities).execute()
-        logger.info(f"Successfully sent {len(opportunities)} raw opportunities to the database for upsert.")
-        return len(opportunities)
-    except APIError as e:
-        logger.error(f"Supabase API error while adding raw opportunities: {e}", exc_info=True)
-    except Exception as e:
-        logger.error(f"An unexpected error occurred while adding raw opportunities: {e}", exc_info=True)
-    return 0
+def get_pending_opportunities() -> list[dict]:
+    """Newest first, so if a run hits its AI budget the freshest opportunities were handled."""
+    return _paginate(lambda: client().table("raw_opportunities")
+                     .select("link,title,source,full_text,published_at,scraped_at")
+                     .eq("status", "pending_analysis")
+                     .order("published_at", desc=True, nullsfirst=False)
+                     .order("link"))
 
-def get_all_scraped_links() -> set:
-    """
-    Retrieves a set of all links that have ever been scraped.
-    """
-    if not supabase:
-        logger.error("Supabase client not initialized. Cannot fetch scraped links.")
-        return set()
 
-    all_links = set()
-    try:
-        page = 0
-        page_size = 1000
-        while True:
-            response = supabase.table('raw_opportunities').select('link').range(page * page_size, (page + 1) * page_size - 1).execute()
-            data = response.data
-            if not data:
-                break
-            
-            for item in data:
-                all_links.add(item['link'])
-            
-            page += 1
-            logger.debug(f"Fetched page {page} of links. Total links so far: {len(all_links)}")
+def bulk_update_statuses(updates: list[dict]):
+    """updates: [{'link': ..., 'status': ...}, ...]"""
+    if updates:
+        client().rpc("bulk_update_raw_status", {"status_updates": updates}).execute()
 
-        logger.info(f"Retrieved a total of {len(all_links)} existing links from the 'raw_opportunities' table.")
-        return all_links
-    except APIError as e:
-        logger.error(f"Supabase API error while fetching all scraped links: {e}", exc_info=True)
-    except Exception as e:
-        logger.error(f"An unexpected error occurred while fetching links: {e}", exc_info=True)
-    return all_links
 
-def get_pending_opportunities() -> list:
-    """
-    Fetches all opportunities from 'raw_opportunities' that need AI analysis.
-    """
-    if not supabase:
-        logger.error("Supabase client not initialized. Cannot fetch pending opportunities.")
-        return []
-
-    try:
-        response = supabase.table('raw_opportunities').select('*', count='exact').eq('status', 'pending_analysis').execute()
-        count = response.count
-        logger.info(f"Found {count} opportunities pending analysis.")
-        return response.data
-    except APIError as e:
-        logger.error(f"Supabase API error while fetching pending opportunities: {e}", exc_info=True)
-    except Exception as e:
-        logger.error(f"An unexpected error occurred fetching pending opportunities: {e}", exc_info=True)
-    return []
-
-# --- This function will no longer be called in the main loop, replaced by the bulk version ---
-def update_raw_opportunity_status(link: str, status: str):
-    """
-    Updates the status of a SINGLE opportunity in the 'raw_opportunities' table.
-    DEPRECATED for use in loops; use bulk_update_raw_opportunity_statuses instead.
-    """
-    if not supabase:
-        logger.error("Supabase client not initialized. Cannot update status.")
-        return
-
-    try:
-        supabase.table('raw_opportunities').update({'status': status}).eq('link', link).execute()
-        logger.debug(f"Updated status for {link} to '{status}'.")
-    except APIError as e:
-        logger.error(f"Supabase API error updating status for {link}: {e}", exc_info=True)
-    except Exception as e:
-        logger.error(f"An unexpected error occurred updating status for {link}: {e}", exc_info=True)
-
-# --- START: NEW BULK UPDATE FUNCTION ---
-def bulk_update_raw_opportunity_statuses(updates: list[dict]):
-    """
-    Updates the status of multiple opportunities in a single database call
-    by calling the 'bulk_update_raw_status' stored procedure.
-
-    Args:
-        updates (list[dict]): A list of dictionaries, where each dict has
-                              a 'link' and 'status' key.
-                              e.g., [{'link': 'url1', 'status': 'processed_relevant'}, ...]
-    """
-    if not supabase:
-        logger.error("Supabase client not initialized. Cannot perform bulk update.")
-        return
-
-    if not updates:
-        logger.info("No status updates to perform in bulk.")
-        return
-
-    try:
-        # Call the 'bulk_update_raw_status' stored procedure we created in Supabase.
-        # The first argument is the function name, the second is a dictionary of parameters.
-        supabase.rpc('bulk_update_raw_status', {'status_updates': updates}).execute()
-        logger.info(f"Successfully sent a bulk update for {len(updates)} opportunity statuses.")
-    except APIError as e:
-        logger.error(f"Supabase API error during bulk status update: {e}", exc_info=True)
-    except Exception as e:
-        logger.error(f"An unexpected error occurred during bulk status update: {e}", exc_info=True)
-# --- END: NEW BULK UPDATE FUNCTION ---
-
-def add_processed_opportunity(opportunity_data: dict):
-    """
-    Adds a fully processed, relevant opportunity to the 'processed_opportunities' table.
-    """
-    if not supabase:
-        logger.error("Supabase client not initialized. Cannot add processed opportunity.")
-        return
-
-    try:
-        supabase.table('processed_opportunities').upsert(opportunity_data).execute()
-        logger.info(f"Successfully saved processed opportunity '{opportunity_data.get('title', 'N/A')[:40]}...' to the database.")
-    except APIError as e:
-        logger.error(f"Supabase API error while adding processed opportunity: {e}", exc_info=True)
-    except Exception as e:
-        logger.error(f"An unexpected error occurred adding processed opportunity: {e}", exc_info=True)
-
-def delete_expired_opportunities():
-    """
-    Deletes records from 'processed_opportunities' where the 'deadline' is in the past.
-    """
-    if not supabase:
-        logger.error("Supabase client not initialized. Cannot delete expired opportunities.")
-        return
-
-    try:
-        today_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-        logger.info(f"Checking for opportunities with deadlines before {today_utc}...")
-        
-        # --- FIX: Use `None` to check for SQL NULL instead of the string 'null' ---
-        response = supabase.table('processed_opportunities').delete(count='exact').not_.is_('deadline', None).lt('deadline', today_utc).execute()
-        
-        count = response.count
-        if count > 0:
-            logger.info(f"Successfully deleted {count} expired opportunities.")
-        else:
-            logger.info("No expired opportunities found to delete.")
-
-    except APIError as e:
-        logger.error(f"Supabase API error while deleting expired opportunities: {e}", exc_info=True)
-    except Exception as e:
-        logger.error(f"An unexpected error occurred while deleting expired opportunities: {e}", exc_info=True)
-
-def delete_stale_opportunities(threshold_months: int):
-    """
-    Deletes "stale" records: those with no deadline that are older than a
-    given threshold.
-    """
-    if not supabase:
-        logger.error("Supabase client not initialized. Cannot delete stale opportunities.")
-        return
-
-    try:
-        cutoff_date = datetime.now(timezone.utc) - relativedelta(months=threshold_months)
-        cutoff_iso = cutoff_date.isoformat()
-        
-        logger.info(f"Checking for stale opportunities created before {cutoff_date.strftime('%Y-%m-%d')}...")
-
-        stale_keywords = ['Not Specified', 'N/A']
-
-        # --- FIX: Use `None` to check for SQL NULL instead of the string 'null' ---
-        response = (
-            supabase.table('processed_opportunities')
-            .delete(count='exact')
-            .is_('deadline', None) # Condition 1: Must not have a parsed deadline.
-            .in_('raw_deadline_text', stale_keywords) # Condition 2: Must be explicitly "Not Specified".
-            .lt('processed_at', cutoff_iso) # Condition 3: Must be older than our threshold.
-            .execute()
-        )
-        
-        count = response.count
-        if count > 0:
-            logger.info(f"Successfully deleted {count} stale opportunities.")
-        else:
-            logger.info("No stale opportunities found to delete.")
-            
-    except APIError as e:
-        logger.error(f"Supabase API error while deleting stale opportunities: {e}", exc_info=True)
-    except Exception as e:
-        logger.error(f"An unexpected error occurred while deleting stale opportunities: {e}", exc_info=True)
+# --- Final table -----------------------------------------------------------
+def upsert_processed_opportunity(record: dict):
+    record = {**record, "processed_at": datetime.now(timezone.utc).isoformat()}
+    client().table("processed_opportunities").upsert(record, on_conflict="link").execute()
