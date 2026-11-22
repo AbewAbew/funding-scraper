@@ -1,139 +1,93 @@
+# Funding Opportunities for Ethiopian CSOs
 
+A free, automated pipeline that collects grant and funding calls from opportunity websites, uses an AI model to
+check whether **organisations based in Ethiopia can apply**, and stores the relevant ones (with funder, amount,
+deadline, focus areas and a plain-language summary) in a Supabase database.
 
-# Resilient, Self-Healing Funding Aggregator & AI Pipeline
+The goal is to give rural civil society organisations the same view of funding opportunities that well-connected
+urban organisations have. It runs once a day on GitHub Actions and costs nothing to operate.
 
-This project is an automated, resilient, multi-stage data engineering pipeline that scrapes funding opportunities, analyzes them with AI, and stores them in a persistent cloud database. It is designed for high performance, fault tolerance, and efficiency. The system is **self-healing**, automatically retrying temporary network or API failures and isolating permanent data quality issues to ensure the pipeline never gets stuck.
-
-The system's core is a three-stage process:
-1.  **Maintenance:** Automatically purges old, expired opportunities from the final database to keep the dataset clean and relevant.
-2.  **Collector:** Concurrently scrapes multiple websites for new funding opportunities. It intelligently filters out very old posts at the source, handles relative dates (e.g., "2 weeks ago"), and uses resilient retry mechanisms to overcome network errors.
-3.  **Processor:** Fetches pending opportunities from a persistent cloud queue. It runs them through a sophisticated, two-step AI analysis pipeline that first filters for geographic relevance and then performs a full data enrichment using heavily optimized prompts. The processor intelligently handles different types of AI failures, proactively discards expired opportunities, and saves only clean, validated data to the final database.
-
-This two-table, multi-stage architecture ensures that the expensive AI analysis is decoupled from the scraping process, making the system robust, re-processable, and cost-effective.
-
----
-
-### Key Features
-
--   **Robust Three-Stage Pipeline Architecture:**
-    -   **Maintenance Stage:** Automatically deletes long-expired opportunities at the start of each run.
-    -   **Collector Stage:** Scrapes all sources, pre-filters by publication date, and saves raw data to a `raw_opportunities` queue. Fast, cheap, and isolated from downstream failures.
-    -   **Processor Stage:** Independently works through the queue, performing all AI analysis and data validation.
--   **Intelligent, Multi-Tiered Error Handling:**
-    -   **Scraper Retries:** Automatically retries failed web requests with exponential backoff to handle temporary server issues. Scrapers are also equipped with browser-like headers to avoid being blocked.
-    -   **AI Retries:** Intelligently handles API rate limit errors by waiting for the duration recommended by the Google API.
-    -   **Self-Healing for Temporary AI Failures:** If an AI call fails due to a temporary issue (e.g., rate limit, network blip), the opportunity is left in the queue to be **automatically retried on the next run**.
-    -   **Isolation of Permanent AI Failures:** If the AI returns corrupted or malformed data (e.g., invalid JSON), the item is flagged with a unique `processed_ai_error` status and **permanently removed from the queue** to prevent the pipeline from getting stuck.
--   **Advanced Caching & Cost-Efficiency:**
-    -   **Publication Date Filtering:** Prevents scraping and processing of articles that are too old to be relevant, saving significant time and API costs.
-    -   **Proactive Expiration Filtering:** Prevents wasting AI credits by catching and discarding expired opportunities *during* the processing stage, before they are saved to the final database.
-    -   **Scraping Cache:** Prevents re-scraping of any link ever seen by checking the `raw_opportunities` table.
-    -   **Sophisticated Multi-Status Caching:** The `status` column in the raw data table now tracks multiple states (`pending_analysis`, `processed_relevant`, `processed_irrelevant`, `processed_expired`, `processed_ai_error`), providing granular control and preventing re-processing of any item, regardless of its outcome.
--   **Highly Accurate Geographic Filtering & Data Enrichment:**
-    -   Leverages AI for initial geographic extraction, followed by a high-precision Python script that applies "Specifics over Generals" logic to eliminate false positives.
-    -   **Enhanced AI Prompts:** The AI prompt for deadline extraction has been heavily optimized with specific instructions, examples, and keywords to dramatically improve accuracy.
-    -   **Debuggability with Raw AI Output:** A new `raw_deadline_text` column in the final database stores the AI's exact output, making it trivial to diagnose parsing errors and verify prompt effectiveness.
-    -   **Flexible Date Parsing:** Upgraded from rigid regex to `python-dateutil`, allowing the system to robustly parse various human-readable date formats provided by the AI.
--   **Persistent Cloud Database (Supabase/PostgreSQL):**
-    -   Uses a professional-grade cloud PostgreSQL database.
-    -   Enables data accessibility for other applications and team members.
-    -   Uses a two-table schema (`raw_opportunities`, `processed_opportunities`) to power the resilient pipeline.
-
----
-
-### Technology Stack
-
--   Python 3
--   **Supabase (PostgreSQL):** For the cloud-based, persistent database.
--   `requests` & `urllib3`: For making resilient, retrying HTTP requests.
--   `beautifulsoup4`: For parsing HTML.
--   `google-generativeai`: For interacting with the Gemini API.
--   `supabase-py`: Python client for interacting with the Supabase database.
--   `python-dotenv`: For managing secret API keys.
--   `python-dateutil`: For robustly parsing dates from various string formats.
-
----
-
-### Project Structure
+## How it works
 
 ```
-/funding_scraper/
-│
-├── .env                      # Stores all secret keys (Google, Supabase). DO NOT SHARE.
-├── config.py                 # Central configuration for scrapers, AI, and logging.
-├── main.py                   # Main orchestrator for the Maintenance, Collector, and Processor stages.
-├── database_manager.py       # Manages all interactions with the Supabase cloud database.
-├── ai_analyzer.py            # The "brain" with all AI-related functions and retry logic.
-├── utils.py                  # Utility functions for creating Supabase clients and retry sessions.
-│
-├── gso_scraper.py            # Scraper for globalsouthopportunities.com.
-├── ofy_scraper.py            # Scraper for opportunitiesforyouth.org.
-├── od_scraper.py             # Scraper for opportunitydesk.org.
-│
-├── requirements.txt          # Lists all Python libraries needed for the project.
-├── schema.sql                # SQL script to create the required tables in Supabase.
-└── funding_scraper.log       # Detailed log file for monitoring and debugging.
+ Stage 0  maintenance   delete expired / stale opportunities, tidy the queue           (SQL, no AI)
+ Stage 1  collect       WordPress REST API of each source -> raw_opportunities queue  (~1 min, no AI)
+ Stage 2  process       for each pending post, newest first:
+                          1. clearly past deadline in the text?  -> processed_expired  (no AI)
+                          2. one AI call: locations, Ethiopia eligibility, applicant types,
+                             funder, amount, deadline, focus areas, summary
+                          3. deterministic Ethiopia rules (filters.assess_relevance)
+                          4. relevant & still open -> processed_opportunities
 ```
 
----
+* **Sources** (`config.SOURCES`): Global South Opportunities, Opportunities For Youth, Opportunity Desk. Each is read
+  through `/wp-json/wp/v2/posts`, which returns 100 posts per request with full text, so nothing breaks when a site's
+  theme changes. To add another WordPress site, add its base URL and category id.
+* **AI** (`llm.py`): providers are tried in order and benched when their free quota runs out.
+  1. Google **Gemma 4** (`gemma-4-31b-it`) via the Gemini API: free, no billing account needed.
+  2. **Groq** (`openai/gpt-oss-120b`), an optional free fallback.
+  3. OpenRouter, an optional second fallback.
 
-### Setup and Installation
+  Requests are paced client-side (requests/min and tokens/min) to stay inside free tiers.
+* **Budgets**: each run stops after `MAX_AI_CALLS_PER_RUN` (400) calls or `MAX_PROCESSOR_MINUTES` (100). Anything left
+  stays `pending_analysis` and is handled the next day, so a big backlog is simply spread over a few runs.
+* **Failures**: if every provider is down or rate-limited, the post stays pending and is retried tomorrow. If the
+  model returns unusable output twice, the post is marked `processed_ai_error` so it can't block the queue.
 
-**1. Clone the Repository:**
+### Queue statuses (`raw_opportunities.status`)
+`pending_analysis` · `processed_relevant` · `processed_irrelevant` · `processed_expired` · `processed_ai_error` ·
+`skipped_stale` (too old to be worth an AI call)
+
+## Setup
+
+1. **Database**: in the Supabase SQL Editor run [`sql/schema.sql`](sql/schema.sql). It works on a new project *and*
+   upgrades the existing one without deleting data. (The original 2025 scripts are kept in `sql/legacy/`.)
+2. **Keys**: get a free Gemini API key at <https://aistudio.google.com/apikey> and, optionally, a Groq key at
+   <https://console.groq.com/keys>. Check your project's actual free limits in AI Studio; if they're higher than the
+   defaults in `config.py`, raise `GEMINI_RPM` / `GEMINI_TPM`.
+3. **GitHub Secrets** (Settings → Secrets and variables → Actions): `GOOGLE_API_KEY`, `SUPABASE_URL`,
+   `SUPABASE_SECRET_KEY` (the `sb_secret_...` key from Supabase → Settings → API Keys), and optionally
+   `GROQ_API_KEY`, `OPENROUTER_API_KEY`. The legacy `SUPABASE_SERVICE_KEY` (service_role JWT) is still accepted as a
+   fallback, but Supabase deprecates it at the end of 2026.
+4. **Local runs**: `cp .env.example .env` and fill it in, then:
    ```bash
-   git clone <your-repo-url>
-   cd funding_scraper
-   ```
-
-**2. Set up Supabase Project:**
-   - Go to [supabase.com](https://supabase.com), create a free account, and set up a new project.
-   - Navigate to the **SQL Editor** in your new project.
-   - **Important:** Use the updated `schema.sql` file from this project. It contains the necessary columns, including the new `raw_deadline_text` field.
-   - Copy the entire content of `schema.sql`, paste it into the editor, and click **RUN**. This will set up the `raw_opportunities` and `processed_opportunities` tables correctly.
-
-**3. Set up the Python Environment:**
-   ```bash
-   # Create a virtual environment
-   python -m venv venv
-
-   # Activate it (Windows)
-   venv\Scripts\activate
-   # Or (macOS/Linux)
-   source venv/bin/activate
-   ```
-
-**4. Install Dependencies:**
-   Create a `requirements.txt` file with the following content:
-   ```
-   requests
-   beautifulsoup4
-   google-generativeai
-   python-dotenv
-   supabase
-   python-dateutil
-   pyinstaller
-   ```
-   Then run:
-   ```bash
+   python -m venv .venv && source .venv/bin/activate
    pip install -r requirements.txt
+   pytest                                   # unit tests, no keys needed
+   python main.py --dry-run --limit 5       # scrape + analyse 5 posts, print them, write nothing
+   python main.py                           # full run
+   python main.py --stages collect          # only scrape
+   python main.py --max-ai-calls 50         # smaller AI budget
    ```
 
-**5. Configure your API Keys:**
-   - In the project folder, create a file named exactly `.env`.
-   - Add your keys to the file. **Get the `service_role` key from Supabase**, not the public `anon` key.
+## Data for front ends
 
-     ```.env
-     GOOGLE_API_KEY="PASTE_YOUR_GOOGLE_API_KEY_HERE"
-     SUPABASE_URL="PASTE_YOUR_SUPABASE_PROJECT_URL_HERE"
-     SUPABASE_SERVICE_KEY="PASTE_YOUR_SUPABASE_SERVICE_ROLE_KEY_HERE"
-     ```
+Read `processed_opportunities` with the **publishable** key (`sb_publishable_...`, formerly the anon key). Row Level Security allows read-only access to that
+table and nothing else. Useful columns: `title`, `link`, `funder`, `funding_amount`, `deadline` (DATE, NULL when
+rolling/unspecified), `raw_deadline_text`, `geographic_scope`, `focus_areas`, `applicant_types`, `summary`,
+`published_at`.
 
-### How to Run
+Set `DROP_INDIVIDUAL_ONLY=true` to exclude opportunities only open to individuals (scholarships, fellowships).
+By default they're kept and tagged in `applicant_types`.
 
-Once setup is complete, run the `main.py` script from your activated virtual environment.
+## Keeping it alive on free tiers
 
-```bash
-python main.py
+* **GitHub** disables scheduled workflows after 60 days without commits. The workflow re-enables itself through the
+  API on each scheduled run. If it ever shows as disabled, open the Actions tab and click *Enable workflow*.
+* **Supabase** pauses free projects after about a week of inactivity. The daily run counts as activity.
+* **Free AI limits change.** If runs start logging "benched", check the limits in AI Studio or Groq, or change
+  `GEMINI_MODEL` / `GROQ_MODEL`.
+
+## Project layout
+
 ```
-
-The script will execute its three stages in order: Maintenance, Collector, and Processor. The final, clean data will be available in the `processed_opportunities` table in your Supabase project.
+main.py              pipeline stages + CLI
+scrapers.py          WordPress REST collector
+filters.py           no-AI logic: deadline parsing, expired pre-filter, text trimming, Ethiopia rules
+ai_analyzer.py       prompt, JSON parsing and validation
+llm.py               multi-provider client with rate limiting and fallback
+database_manager.py  Supabase access
+config.py            all settings (overridable with environment variables)
+sql/schema.sql       tables, RLS, bulk-update and maintenance functions
+tests/               pytest suite
+```

@@ -2,35 +2,70 @@ name: Funding Scraper
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # Run daily at 6 AM UTC
-  workflow_dispatch:  # Allow manual trigger
+    - cron: '0 6 * * *'  # daily, 06:00 UTC (09:00 Addis Ababa)
+  workflow_dispatch:
+    inputs:
+      stages:
+        description: 'Stages to run (maintenance,collect,process)'
+        default: 'maintenance,collect,process'
+      max_ai_calls:
+        description: 'Max AI calls this run'
+        default: '400'
+
+concurrency:
+  group: funding-scraper
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # only for the keep-alive step below
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 150
+
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-    
-    - name: Install dependencies
-      run: |
-        pip install -r requirements-minimal.txt
-    
-    - name: Setup Tor for blocked sites
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y tor
-        sudo service tor start
-    
-    - name: Run scraper
-      env:
-        GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-        SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      run: |
-        python main.py || echo "Some scrapers were blocked but action completed"
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start Tor (used only for sources that block GitHub's IPs)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tor
+          sudo service tor start
+
+      - name: Run pipeline
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}     # new sb_secret_... key (preferred)
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}   # legacy fallback; remove after migrating
+          MAX_AI_CALLS_PER_RUN: ${{ inputs.max_ai_calls || '400' }}
+          STAGES: ${{ inputs.stages || 'maintenance,collect,process' }}
+        run: python main.py --stages "$STAGES"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: funding-scraper-log
+          path: funding_scraper.log
+          retention-days: 14
+
+      # GitHub disables scheduled workflows after 60 days without repository activity
+      # (that is what stopped this pipeline in July 2026). Re-enabling via the API keeps it alive.
+      - name: Keep scheduled workflow alive
+        if: always() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/funding-scraper.yml/enable" || true

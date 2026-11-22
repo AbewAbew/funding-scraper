@@ -1,291 +1,259 @@
-# main.py (Corrected and Refactored for Bulk Updates)
-import time
-import concurrent.futures
-import threading
+"""
+Funding opportunity pipeline for Ethiopian CSOs.
+
+  Stage 0  maintenance  - delete expired/stale opportunities, skip stale queue items (server-side SQL)
+  Stage 1  collect      - pull recent posts from each source's WordPress API into `raw_opportunities`
+  Stage 2  process      - pre-filter without AI, then one AI call per remaining post; save relevant ones
+
+Usage:
+  python main.py                         # full run
+  python main.py --stages collect        # only scrape
+  python main.py --max-ai-calls 50       # smaller AI budget for this run
+  python main.py --dry-run --limit 5     # scrape + analyse 5 posts, print results, write nothing
+  python main.py --check                 # read-only check that the Supabase key works
+"""
+import argparse
+import json
 import logging
-import re
-from datetime import datetime, date
-from dateutil.parser import parse as parse_date
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
 
 import config
-from gso_scraper import scrape_gso
-from ofy_scraper import scrape_ofy
-from od_scraper import scrape_od
-from ai_analyzer import get_geographic_scope, get_enrichment_data
 import database_manager as db
+from ai_analyzer import MalformedAIResponse, analyze
+from filters import assess_relevance, is_clearly_expired, normalize_deadline
+from llm import LLMClient, TemporaryAIError
+from scrapers import collect_all
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("pipeline")
 
-# --- Helper Functions ---
+STATUS_FLUSH_EVERY = 20
+
 
 def setup_logging():
-    """Configures the root logger based on settings in config.py."""
-    root_logger = logging.getLogger()
-    root_logger.setLevel(config.LOG_LEVEL)
+    root = logging.getLogger()
+    root.setLevel(config.LOG_LEVEL)
+    root.handlers.clear()
+    fmt = logging.Formatter(config.LOG_FORMAT)
+    for handler in (logging.FileHandler(config.LOG_FILE, encoding="utf-8"), logging.StreamHandler(sys.stdout)):
+        handler.setFormatter(fmt)
+        root.addHandler(handler)
+    for noisy in ("urllib3", "httpx", "httpcore", "google_genai", "hpack"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    if root_logger.hasHandlers():
-        root_logger.handlers.clear()
 
-    file_handler = logging.FileHandler(config.LOG_FILE, mode='a', encoding='utf-8')
-    file_handler.setLevel(config.LOG_LEVEL)
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setLevel(config.LOG_LEVEL)
-
-    formatter = logging.Formatter(config.LOG_FORMAT)
-    file_handler.setFormatter(formatter)
-    stream_handler.setFormatter(formatter)
-
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(stream_handler)
-
-    logging.getLogger('google.api_core').setLevel(logging.WARNING)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger('httpx').setLevel(logging.WARNING)
-
-def validate_and_clean_deadline(deadline_str: str) -> str | None:
-    """
-    Tries to parse a date string and returns it in YYYY-MM-DD format.
-    Returns None if the string is a non-date keyword or cannot be interpreted as a date.
-    """
-    if not deadline_str or not isinstance(deadline_str, str):
+def _date_only(ts: str | None) -> date | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+    except ValueError:
         return None
 
-    if any(keyword in deadline_str.lower() for keyword in ['rolling', 'ongoing', 'specified', 'quarterly', 'n/a']):
-        logger.debug(f"Deadline '{deadline_str}' identified as a non-date keyword. Storing as NULL.")
-        return None
+
+# ---------------------------------------------------------------------------
+# Decision logic for one opportunity (pure apart from the AI call; easy to test)
+# ---------------------------------------------------------------------------
+def evaluate(opp: dict, llm: LLMClient) -> tuple[str, dict | None]:
+    """
+    Returns (status, final_record_or_None).
+    Raises TemporaryAIError when it should be retried on a later run.
+    """
+    title, text = opp.get("title") or "", opp.get("full_text") or ""
+    published = _date_only(opp.get("published_at") or opp.get("scraped_at"))
+
+    if len(text) < 200:
+        logger.info("SKIP (no content): %s", title[:70])
+        return "processed_irrelevant", None
+
+    expired_on = is_clearly_expired(text)
+    if expired_on:
+        logger.info("SKIP (deadline %s passed, no AI used): %s", expired_on, title[:70])
+        return "processed_expired", None
 
     try:
-        parsed_date = parse_date(deadline_str)
-        return parsed_date.strftime('%Y-%m-%d')
-    except (ValueError, TypeError):
-        logger.debug(f"Could not parse '{deadline_str}' as a valid date. Storing as NULL.")
-        return None
+        result, model = analyze(llm, title, text, published.isoformat() if published else None)
+    except MalformedAIResponse as e:
+        logger.error("AI output unusable for '%s': %s", title[:70], e)
+        return "processed_ai_error", None
 
-# --- Core Pipeline Stages ---
+    relevant, reason = assess_relevance(result["eligible_locations"], result["excluded_locations"],
+                                        result["ethiopia_eligible"])
+    if not relevant:
+        logger.info("DROP (%s): %s", reason, title[:70])
+        return "processed_irrelevant", None
 
-def run_maintenance_stage():
-    """
-    Stage 0: Performs database maintenance:
-    1. Deletes opportunities with a hard deadline that is in the past.
-    2. Deletes "stale" opportunities (no deadline and older than a set threshold).
-    """
-    logger.info("=========================================================")
-    logger.info(">>> STAGE 0: MAINTENANCE - STARTING CLEANUP <<<")
-    logger.info("=========================================================")
-    db.delete_expired_opportunities()
-    db.delete_stale_opportunities(config.STALE_OPPORTUNITY_MONTHS)
-    logger.info(">>> MAINTENANCE STAGE COMPLETE <<<")
+    if config.DROP_INDIVIDUAL_ONLY and result["applicant_types"] == ["Individuals"]:
+        logger.info("DROP (individuals only): %s", title[:70])
+        return "processed_irrelevant", None
 
-def run_collector_stage():
-    """
-    Stage 1: Scrapes all sources concurrently, filters out already-scraped links,
-    and saves new raw opportunities to the database.
-    """
-    logger.info("=========================================================")
-    logger.info(">>> STAGE 1: COLLECTOR - STARTING SCRAPING PHASE <<<")
-    logger.info("=========================================================")
-    existing_links = db.get_all_scraped_links()
-    all_new_raw_opportunities = []
-    scraper_functions = [scrape_gso, scrape_ofy, scrape_od]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(scraper_functions)) as executor:
-        future_to_scraper = {executor.submit(f, existing_links): f.__name__ for f in scraper_functions}
-        for future in concurrent.futures.as_completed(future_to_scraper):
-            scraper_name = future_to_scraper[future]
-            try:
-                result = future.result()
-                if result:
-                    all_new_raw_opportunities.extend(result)
-            except Exception:
-                logger.error(f"Scraper '{scraper_name}' failed during execution.", exc_info=True)
+    deadline = normalize_deadline(result["deadline"], reference=published)
+    if deadline and date.fromisoformat(deadline) < date.today():
+        logger.info("DROP (deadline %s passed): %s", deadline, title[:70])
+        return "processed_expired", None
 
-    logger.info(f"Scraping complete. Found a total of {len(all_new_raw_opportunities)} new raw opportunities across all sources.")
-    unique_opportunities = []
-    seen_links = set()
-    for opp in all_new_raw_opportunities:
-        link = opp.get('link')
-        if link and link not in seen_links:
-            unique_opportunities.append(opp)
-            seen_links.add(link)
-    if len(all_new_raw_opportunities) > len(unique_opportunities):
-        removed_count = len(all_new_raw_opportunities) - len(unique_opportunities)
-        logger.info(f"De-duplicated raw opportunities: removed {removed_count} cross-posted duplicates.")
-    if unique_opportunities:
-        db.add_raw_opportunities(unique_opportunities)
-    else:
-        logger.info("No new raw opportunities found to save.")
-    logger.info(">>> COLLECTOR STAGE COMPLETE <<<")
+    logger.info("KEEP (%s) deadline=%s: %s", reason, deadline or result["deadline"], title[:70])
+    record = {
+        "link": opp["link"],
+        "title": title,
+        "source": opp.get("source"),
+        "geographic_scope": ", ".join(result["eligible_locations"]) or "Not specified",
+        "funding_amount": result["funding_amount"],
+        "funder": result["funder"],
+        "deadline": deadline,
+        "raw_deadline_text": result["deadline"],
+        "focus_areas": ", ".join(result["focus_areas"]),
+        "applicant_types": ", ".join(result["applicant_types"]),
+        "summary": result["summary"],
+        # Fall back to when we first saw it, so the age-based cleanup still works for old queue items.
+        "published_at": opp.get("published_at") or opp.get("scraped_at"),
+        "ai_model": model,
+    }
+    return "processed_relevant", record
 
 
-# --- START: REFACTORED PROCESSOR STAGE ---
-def run_processor_stage():
-    """
-    Stage 2: Fetches 'pending' opportunities, runs them through the AI pipeline,
-    and updates their statuses in a single efficient batch operation at the end.
-    """
-    logger.info("=========================================================")
-    logger.info(">>> STAGE 2: PROCESSOR - STARTING ANALYSIS PHASE <<<")
-    logger.info("=========================================================")
+# ---------------------------------------------------------------------------
+# Stages
+# ---------------------------------------------------------------------------
+def run_maintenance():
+    logger.info(">>> STAGE 0: maintenance")
+    counts = db.run_maintenance(config.STALE_OPPORTUNITY_MONTHS, config.RAW_TEXT_RETENTION_DAYS,
+                                config.ARTICLE_CUTOFF_MONTHS)
+    logger.info("Maintenance: %s", counts)
 
-    opportunities_to_process = db.get_pending_opportunities()
-    if not opportunities_to_process:
-        logger.info("No new opportunities are pending analysis. Processor stage finished.")
+
+def run_collector(dry_run: bool = False) -> list[dict]:
+    logger.info(">>> STAGE 1: collect")
+    existing = set() if dry_run else db.get_all_scraped_links()
+    logger.info("%d links already known", len(existing))
+    records = collect_all(existing)
+    if not dry_run:
+        db.add_raw_opportunities(records)
+    logger.info("Collected %d new posts", len(records))
+    return records
+
+
+def run_processor(llm: LLMClient, max_ai_calls: int, items: list[dict] | None = None, dry_run: bool = False):
+    logger.info(">>> STAGE 2: process")
+    pending = items if items is not None else db.get_pending_opportunities()
+    logger.info("%d posts pending analysis (AI budget this run: %d calls, %d min)",
+                len(pending), max_ai_calls, config.MAX_PROCESSOR_MINUTES)
+    if not pending:
         return
 
-    logger.info(f"Found {len(opportunities_to_process)} opportunities to analyze.")
-    logger.info(f"AI analysis will run with max {config.MAX_CONCURRENT_AI_CALLS} concurrent calls.")
+    deadline_ts = time.monotonic() + config.MAX_PROCESSOR_MINUTES * 60
+    stats, buffer = {}, []
+    gate = threading.Lock()
+    in_flight = 0
 
-    ai_semaphore = threading.Semaphore(config.MAX_CONCURRENT_AI_CALLS)
-    processed_count = 0
-    relevant_count = 0
-    
-    # This list will collect all the status updates we need to make.
-    status_updates_to_commit = []
+    def worker(opp: dict):
+        """Runs in a thread. Returns (status, record), or a ('left_pending', reason) marker."""
+        nonlocal in_flight
+        with gate:
+            if llm.calls_made + in_flight >= max_ai_calls:
+                return "left_pending", "AI call budget reached"
+            if time.monotonic() > deadline_ts:
+                return "left_pending", "time budget reached"
+            if not llm.available:
+                return "left_pending", "no AI provider left (quota exhausted?)"
+            in_flight += 1
+        try:
+            return evaluate(opp, llm)
+        except TemporaryAIError as e:
+            return "left_pending", f"temporary AI failure: {e}"
+        finally:
+            with gate:
+                in_flight -= 1
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=config.MAX_CONCURRENT_AI_CALLS) as executor:
-        # Submit the new worker function 'analyze_opportunity'.
-        future_to_opp = {
-            executor.submit(analyze_opportunity, opp, ai_semaphore): opp
-            for opp in opportunities_to_process
-        }
+    def flush():
+        if buffer and not dry_run:
+            db.bulk_update_statuses(buffer)
+        buffer.clear()
 
-        for future in concurrent.futures.as_completed(future_to_opp):
-            processed_count += 1
-            try:
-                # The worker now returns a tuple: (is_relevant, status_update_dict)
-                is_relevant, status_update = future.result()
-                
-                # Only add to the batch if the analysis was successful
-                if status_update:
-                    status_updates_to_commit.append(status_update)
-                
-                if is_relevant:
-                    relevant_count += 1
-                
-                logger.debug(f"Completed analysis for item {processed_count}/{len(opportunities_to_process)}")
-
-            except Exception as e:
-                opp = future_to_opp[future]
-                logger.error(f"A critical unhandled error occurred while analyzing {opp.get('link', 'N/A')}", exc_info=True)
-
-    # After the loop finishes, perform the single bulk update.
-    if status_updates_to_commit:
-        logger.info(f"Committing {len(status_updates_to_commit)} status updates to the database in a single batch...")
-        db.bulk_update_raw_opportunity_statuses(status_updates_to_commit)
-
-    logger.info(f"Analysis complete. Of {processed_count} processed opportunities, {relevant_count} were relevant.")
-    logger.info(">>> PROCESSOR STAGE COMPLETE <<<")
-
-
-def analyze_opportunity(opportunity: dict, semaphore: threading.Semaphore) -> tuple[bool | None, dict | None]:
-    """
-    Analyzes a single opportunity and returns its relevance and the required status update.
-    IT DOES NOT WRITE THE STATUS UPDATE TO THE DATABASE ITSELF.
-    Returns: A tuple (is_relevant, status_update_dict).
-             The status_update_dict is None if the item should be retried.
-    """
-    with semaphore:
-        title = opportunity.get('title', 'No Title')
-        link = opportunity.get('link')
-        full_text = opportunity.get('full_text', '')
-
-        logger.info(f"--- Analyzing: \"{title[:60]}...\" ---")
-
-        geo_data = get_geographic_scope(title, full_text)
-        is_relevant, reason = is_relevant_for_ethiopia(geo_data)
-
-        if not is_relevant:
-            logger.warning(f"Record DISCARDED (Reason: {reason}). Title: \"{title[:60]}...\"")
-            return False, {'link': link, 'status': 'processed_irrelevant'}
-
-        logger.info(f"Record KEPT (Reason: {reason}). Proceeding to full enrichment.")
-        enrichment_data = get_enrichment_data(title, full_text)
-
-        summary = enrichment_data.get('summary', '')
-        funding = enrichment_data.get('funding_amount', '')
-
-        if "AI call failed" in summary:
-            logger.error(f"AI Enrichment FAILED (Temporary): '{title[:60]}...'. Will retry on next run.")
-            return None, None
-        elif funding == "Error" or "malformed JSON" in summary or "No JSON object" in summary:
-            logger.error(f"AI Enrichment FAILED (Permanent: {summary}): '{title[:60]}...'. Discarding record.")
-            return False, {'link': link, 'status': 'processed_ai_error'}
-
-        raw_deadline_text = enrichment_data.get('deadline')
-        parsed_deadline_str = validate_and_clean_deadline(raw_deadline_text)
-
-        if parsed_deadline_str:
-            deadline_date = datetime.strptime(parsed_deadline_str, '%Y-%m-%d').date()
-            if deadline_date < date.today():
-                logger.warning(f"Record DISCARDED (Reason: Deadline {parsed_deadline_str} is in the past). Title: \"{title[:60]}...\"")
-                return False, {'link': link, 'status': 'processed_expired'}
-
-        final_record = {
-            'link': link,
-            'title': title,
-            'source': opportunity.get('source'),
-            'geographic_scope': ", ".join(geo_data.get('eligible', [])),
-            'funding_amount': enrichment_data.get('funding_amount'),
-            'funder': enrichment_data.get('funder'),
-            'deadline': parsed_deadline_str,
-            'raw_deadline_text': raw_deadline_text,
-            'focus_areas': ', '.join(enrichment_data.get('focus_areas', [])),
-            'summary': enrichment_data.get('summary')
-        }
-
-        # This part is fine to do one-by-one as it's an INSERT, not a high-frequency UPDATE.
-        db.add_processed_opportunity(final_record)
-        
-        # Return the final status update to be processed in the batch.
-        return True, {'link': link, 'status': 'processed_relevant'}
-# --- END: REFACTORED PROCESSOR STAGE ---
+    # Worker threads only call the AI; all database writes happen here, on the main thread.
+    done = 0
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, config.MAX_CONCURRENT_AI_CALLS)) as pool:
+            futures = {pool.submit(worker, opp): opp for opp in pending}
+            for future in as_completed(futures):
+                opp, done = futures[future], done + 1
+                try:
+                    status, record = future.result()
+                except Exception:
+                    logger.exception("Unexpected error analysing %s; left pending", opp.get("link"))
+                    status, record = "left_pending", "unexpected error"
+                stats[status] = stats.get(status, 0) + 1
+                if status == "left_pending":
+                    logger.debug("Left pending (%s): %s", record, opp.get("link"))
+                    continue
+                if dry_run:
+                    if record:
+                        print(json.dumps(record, indent=2, ensure_ascii=False))
+                    continue
+                if record:
+                    db.upsert_processed_opportunity(record)
+                buffer.append({"link": opp["link"], "status": status})
+                if len(buffer) >= STATUS_FLUSH_EVERY:
+                    flush()
+                if done % 25 == 0:
+                    logger.info("Progress: %d/%d, %d AI calls, %s", done, len(pending), llm.calls_made, stats)
+    finally:
+        flush()
+    if stats.get("left_pending"):
+        logger.warning("%d posts left pending for the next run (budget, time limit or AI unavailable)",
+                       stats["left_pending"])
+    logger.info("Processor finished: %s; AI calls used: %d", stats, llm.calls_made)
 
 
-def is_relevant_for_ethiopia(geo_data: dict) -> tuple[bool, str]:
-    """
-    Applies strict, deterministic rules to decide if an opportunity is relevant.
-    """
-    eligible = [str(g).lower().strip() for g in geo_data.get('eligible', [])]
-    excluded = [str(g).lower().strip() for g in geo_data.get('excluded', [])]
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--stages", default="maintenance,collect,process",
+                        help="comma-separated subset of: maintenance,collect,process")
+    parser.add_argument("--max-ai-calls", type=int, default=config.MAX_AI_CALLS_PER_RUN)
+    parser.add_argument("--dry-run", action="store_true", help="don't read/write the database; print results")
+    parser.add_argument("--limit", type=int, default=0, help="dry-run only: analyse at most N posts")
+    parser.add_argument("--check", action="store_true", help="read-only Supabase connection check, then exit")
+    args = parser.parse_args(argv)
+    stages = {s.strip() for s in args.stages.split(",")}
 
-    general_scopes = {
-        'east africa', 'horn of africa', 'africa', 'sub-saharan africa',
-        'global', 'international', 'developing countries'
-    }
+    setup_logging()
+    if args.check:
+        try:
+            logger.info("Supabase connection OK: %s", db.check_connection())
+            return 0
+        except Exception:
+            logger.critical("Supabase connection FAILED", exc_info=True)
+            return 1
+    started = time.time()
+    logger.info("=== Funding pipeline run started (stages: %s%s) ===", ",".join(sorted(stages)),
+                ", DRY RUN" if args.dry_run else "")
+    failed = False
+    try:
+        if args.dry_run:
+            records = run_collector(dry_run=True)
+            if "process" in stages:
+                records.sort(key=lambda r: r.get("published_at") or "", reverse=True)
+                run_processor(LLMClient(), args.max_ai_calls, records[: args.limit or None], dry_run=True)
+        else:
+            if "maintenance" in stages:
+                run_maintenance()
+            if "collect" in stages:
+                run_collector()
+            if "process" in stages:
+                llm = LLMClient()
+                if llm.providers:
+                    run_processor(llm, args.max_ai_calls)
+                else:
+                    failed = True
+    except Exception:
+        logger.critical("Pipeline crashed", exc_info=True)
+        failed = True
+    logger.info("=== Run finished in %.1f min%s ===", (time.time() - started) / 60, " WITH ERRORS" if failed else "")
+    return 1 if failed else 0
 
-    if 'ethiopia' in excluded:
-        return False, "Explicitly excludes Ethiopia"
-    if 'ethiopia' in eligible:
-        return True, "Explicitly includes Ethiopia"
-    
-    specific_countries_found = [loc for loc in eligible if loc not in general_scopes]
-    if specific_countries_found:
-        return False, f"Specific country list found which does not include Ethiopia: {specific_countries_found}"
-    
-    acceptable_general_scopes = [scope for scope in eligible if scope in general_scopes]
-    if acceptable_general_scopes:
-        return True, f"Includes a relevant general scope: {acceptable_general_scopes}"
-
-    return False, f"No relevant geographic scope found. Raw eligible: {eligible}"
-
-
-# --- Main Script Execution ---
 
 if __name__ == "__main__":
-    setup_logging()
-    start_time = time.time()
-    logger.info("=========================================================")
-    logger.info("=== STARTING NEW FUNDING AGGREGATOR RUN (Pipeline v7 - Bulk Operations) ===")
-    
-    try:
-        run_maintenance_stage()
-        run_collector_stage()
-        run_processor_stage()
-    except Exception as e:
-        logger.critical("A critical unhandled exception occurred in the main pipeline. Shutting down.", exc_info=True)
-
-    end_time = time.time()
-    logger.info("=========================================================")
-    logger.info(f"Total process took {((end_time - start_time) / 60):.2f} minutes.")
-    logger.info("=== RUN FINISHED ===")
-    logger.info("=========================================================\n")
+    sys.exit(main())
