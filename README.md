@@ -13,7 +13,7 @@ urban organisations have. It runs once a day on GitHub Actions and costs nothing
  Stage 0  maintenance   delete expired / stale opportunities, tidy the queue           (SQL, no AI)
  Stage 1  collect       WordPress REST API of each source -> raw_opportunities queue  (~1 min, no AI)
  Stage 2  process       for each pending post, newest first:
-                          1. clearly past deadline in the text?  -> processed_expired  (no AI)
+                          1. clearly past deadline in the text?  -> processed_expired  (no AI, whole queue first)
                           2. one AI call: locations, Ethiopia eligibility, applicant types,
                              funder, amount, deadline, focus areas, summary
                           3. deterministic Ethiopia rules (filters.assess_relevance)
@@ -24,12 +24,18 @@ urban organisations have. It runs once a day on GitHub Actions and costs nothing
   through `/wp-json/wp/v2/posts`, which returns 100 posts per request with full text, so nothing breaks when a site's
   theme changes. To add another WordPress site, add its base URL and category id.
 * **AI** (`llm.py`): providers are tried in order and benched when their free quota runs out.
-  1. Google **Gemma 4** (`gemma-4-31b-it`) via the Gemini API: free, no billing account needed.
-  2. **Groq** (`openai/gpt-oss-120b`), an optional free fallback.
-  3. OpenRouter, an optional second fallback.
+  1. Google **Gemma 4** (`gemma-4-31b-it`) via the Gemini API: free, no billing account needed. It "thinks"
+     before answering (~1k tokens, can't be disabled), so calls take ~1 minute and use JSON mode.
+  2. **Gemini Flash-Lite** (`gemini-3.5-flash-lite`): same Google key, its own free quota, fast. Used when Gemma is
+     overloaded ("high demand" errors are common).
+  3. **Groq** (`openai/gpt-oss-120b`), an optional free fallback (about 200k tokens/day, roughly 60 posts).
+  4. OpenRouter, an optional last fallback.
+
+  An overloaded provider is paused (15s, doubling up to 5 min) and retried, never dropped for the run. A provider
+  is only benched when its daily quota runs out or it keeps failing with real errors.
 
   Requests are paced client-side (requests/min and tokens/min) to stay inside free tiers.
-* **Budgets**: each run stops after `MAX_AI_CALLS_PER_RUN` (400) calls or `MAX_PROCESSOR_MINUTES` (100). Anything left
+* **Budgets**: each run stops after `MAX_AI_CALLS_PER_RUN` (400) calls or `MAX_PROCESSOR_MINUTES` (120). Anything left
   stays `pending_analysis` and is handled the next day, so a big backlog is simply spread over a few runs.
 * **Failures**: if every provider is down or rate-limited, the post stays pending and is retried tomorrow. If the
   model returns unusable output twice, the post is marked `processed_ai_error` so it can't block the queue.

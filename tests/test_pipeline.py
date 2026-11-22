@@ -160,14 +160,15 @@ def test_llm_client_without_keys_is_unavailable(monkeypatch):
 
 
 # --- provider failover ------------------------------------------------------------
-class _ScriptedProvider:
-    """Minimal stand-in for llm._Provider with a scripted sequence of outcomes."""
+import llm as llm_mod  # noqa: E402
 
-    def __init__(self, label, outcomes):
-        import llm
-        self.label, self.outcomes, self.calls = label, list(outcomes), 0
-        self.disabled_reason, self.consecutive_failures = None, 0
-        self.limiter = llm.RateLimiter(1000, 10**9)
+
+class _ScriptedProvider(llm_mod._Provider):
+    """Real provider bookkeeping (cooldown, benching) with a scripted sequence of outcomes."""
+
+    def __init__(self, name, outcomes):
+        super().__init__({"name": name, "model": "m", "rpm": 1000, "tpm": 10**9}, "key")
+        self.outcomes, self.calls = list(outcomes), 0
 
     def complete(self, prompt):
         self.calls += 1
@@ -175,6 +176,13 @@ class _ScriptedProvider:
         if isinstance(r, Exception):
             raise r
         return r
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    slept = []
+    monkeypatch.setattr(llm_mod.time, "sleep", slept.append)
+    return slept
 
 
 def _client_with(*providers, monkeypatch):
@@ -185,31 +193,68 @@ def _client_with(*providers, monkeypatch):
     return c
 
 
-def test_overloaded_primary_hands_off_immediately(monkeypatch):
-    import llm
-    gem = _ScriptedProvider("gemini", [llm._Overloaded("503 high demand")])
+def test_overload_retries_primary_once_then_hands_off(monkeypatch, no_sleep):
+    gem = _ScriptedProvider("gemini", [llm_mod._Overloaded("503")] * 2)
     groq = _ScriptedProvider("groq", ["ok"])
     c = _client_with(gem, groq, monkeypatch=monkeypatch)
-    assert c.complete("p") == ("ok", "groq")
-    assert gem.calls == 1 and gem.disabled_reason is None   # not benched, used again for the next post
-    assert c.calls_made == 1                                # failed call didn't eat the budget
+    assert c.complete("p") == ("ok", "groq:m")
+    assert gem.calls == 2 and gem.disabled_reason is None   # paused, never benched
+    assert c.calls_made == 1                                # failed calls don't eat the budget
 
 
-def test_daily_quota_benches_provider(monkeypatch):
-    import llm
-    gem = _ScriptedProvider("gemini", [llm._QuotaExhausted("PerDay")])
+def test_overload_recovers_on_primary_without_touching_fallback(monkeypatch, no_sleep):
+    gem = _ScriptedProvider("gemini", [llm_mod._Overloaded("503"), "ok"])
+    groq = _ScriptedProvider("groq", [])
+    c = _client_with(gem, groq, monkeypatch=monkeypatch)
+    assert c.complete("p") == ("ok", "gemini:m")
+    assert groq.calls == 0 and gem.consecutive_overloads == 0
+
+
+def test_persistent_overload_never_benches_primary(monkeypatch, no_sleep):
+    gem = _ScriptedProvider("gemini", [llm_mod._Overloaded("503")] * 30 + ["finally"])
+    c = _client_with(gem, monkeypatch=monkeypatch)
+    for _ in range(10):  # 10 posts x 3 attempts, all overloaded -> each stays pending
+        with pytest.raises(TemporaryAIError):
+            c.complete("p")
+    assert gem.disabled_reason is None and c.available
+    assert c.complete("p") == ("finally", "gemini:m")
+    assert max(no_sleep) <= 300                             # cooldown is capped
+
+
+def test_daily_quota_benches_provider(monkeypatch, no_sleep):
+    gem = _ScriptedProvider("gemini", [llm_mod._QuotaExhausted("PerDay")])
     groq = _ScriptedProvider("groq", ["a", "b"])
     c = _client_with(gem, groq, monkeypatch=monkeypatch)
-    assert c.complete("p")[1] == "groq"
-    assert c.complete("p")[1] == "groq"
+    assert c.complete("p")[1] == "groq:m"
+    assert c.complete("p")[1] == "groq:m"
     assert gem.calls == 1 and gem.disabled_reason
 
 
-def test_overloaded_without_fallback_retries_then_gives_up(monkeypatch):
-    import llm
-    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
-    gem = _ScriptedProvider("gemini", [llm._Overloaded("503")] * 3)
+def test_repeated_real_errors_still_bench(monkeypatch, no_sleep):
+    gem = _ScriptedProvider("gemini", [RuntimeError("boom")] * 15)
     c = _client_with(gem, monkeypatch=monkeypatch)
-    with pytest.raises(TemporaryAIError):
-        c.complete("p")
-    assert gem.calls == 3
+    for _ in range(5):
+        with pytest.raises(TemporaryAIError):
+            c.complete("p")
+    assert gem.disabled_reason == "too many consecutive failures"
+
+
+# --- pre-filter pass ----------------------------------------------------------------
+def test_prefilter_runs_even_when_no_ai_is_available(monkeypatch):
+    statuses = []
+    monkeypatch.setattr(main.db, "upsert_processed_opportunity", lambda r: None)
+    monkeypatch.setattr(main.db, "bulk_update_statuses", lambda u: statuses.extend(u))
+    llm = FakeLLM()
+    llm.available = False
+    items = [opp(" Deadline: 1 July 2025.", link="https://x.org/old"), opp(link="https://x.org/needs-ai")]
+    main.run_processor(llm, max_ai_calls=10, items=items)
+    assert statuses == [{"link": "https://x.org/old", "status": "processed_expired"}]
+    assert llm.calls_made == 0
+
+
+def test_simultaneous_overloads_do_not_escalate_pause():
+    gem = _ScriptedProvider("gemini", [])
+    first = gem.note_overload()
+    for _ in range(3):           # three parallel requests hit the same spike
+        gem.note_overload()
+    assert first == 15 and gem.consecutive_overloads == 1

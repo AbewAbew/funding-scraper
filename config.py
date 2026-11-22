@@ -39,6 +39,16 @@ AI_PROVIDERS = [
         "tpm": _env_int("GEMINI_TPM", 15000),
     },
     {
+        # Same Google key, separate per-model free quota, different servers: covers Gemma's
+        # "high demand" outages before we spend Groq's small daily token allowance.
+        "name": "gemini-lite",
+        "kind": "gemini",
+        "api_key_env": "GOOGLE_API_KEY",
+        "model": os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite"),
+        "rpm": _env_int("GEMINI_FALLBACK_RPM", 10),
+        "tpm": _env_int("GEMINI_FALLBACK_TPM", 60000),
+    },
+    {
         "name": "groq",
         "kind": "openai_compatible",
         "api_key_env": "GROQ_API_KEY",
@@ -62,7 +72,7 @@ AI_PROVIDERS = [
 # Hard caps per run, so the first (large) backlog is spread over several daily runs.
 # Whatever isn't processed stays `pending_analysis` and is picked up next run (newest first).
 MAX_AI_CALLS_PER_RUN = _env_int("MAX_AI_CALLS_PER_RUN", 400)
-MAX_PROCESSOR_MINUTES = _env_int("MAX_PROCESSOR_MINUTES", 100)
+MAX_PROCESSOR_MINUTES = _env_int("MAX_PROCESSOR_MINUTES", 120)
 # Posts analysed in parallel. Gemma 4 31B takes ~50s per call, so a few in flight keep us near the
 # free-tier pace; the per-provider rate limiter still caps requests and tokens per minute.
 MAX_CONCURRENT_AI_CALLS = _env_int("MAX_CONCURRENT_AI_CALLS", 4)

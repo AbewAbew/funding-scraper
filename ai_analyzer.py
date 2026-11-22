@@ -115,8 +115,5 @@ def analyze(client: LLMClient, title: str, text: str, published: str | None = No
         return parse_response(raw), label
     except MalformedAIResponse as first_error:
         logger.warning("Malformed AI output from %s for '%s' (%s); retrying once", label, title[:50], first_error)
-        if len([p for p in client.providers if not p.disabled_reason]) > 1:
-            raw, label = client.complete(prompt, skip={label})
-        else:
-            raw, label = client.complete(prompt)
+        raw, label = client.complete(prompt)  # same provider order: keeps the fallback's daily quota for outages
         return parse_response(raw), label

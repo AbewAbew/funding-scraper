@@ -89,6 +89,31 @@ class _Provider:
         self.limiter = RateLimiter(spec.get("rpm", 10), spec.get("tpm", 10000))
         self.disabled_reason: str | None = None
         self.consecutive_failures = 0
+        # Overload ("high demand") is temporary: pause the provider instead of benching it.
+        self.consecutive_overloads = 0
+        self.cooldown_until = 0.0
+        self._state_lock = threading.Lock()
+
+    def note_overload(self, max_cooldown: float = 300) -> float:
+        with self._state_lock:
+            now = time.monotonic()
+            if now < self.cooldown_until:
+                # Parallel requests failing in the same spike: don't escalate the pause again.
+                return self.cooldown_until - now
+            self.consecutive_overloads += 1
+            pause = min(15 * 2 ** (self.consecutive_overloads - 1), max_cooldown)
+            self.cooldown_until = now + pause
+            return pause
+
+    def note_success(self):
+        with self._state_lock:
+            self.consecutive_failures = 0
+            self.consecutive_overloads = 0
+
+    def wait_for_cooldown(self):
+        remaining = self.cooldown_until - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
 
     @property
     def label(self) -> str:
@@ -112,7 +137,11 @@ class _GeminiProvider(_Provider):
             resp = self._client.models.generate_content(
                 model=self.model,
                 contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=1200),
+                # Gemma 4 always "thinks" first (often ~1k tokens, and it can't be disabled), so leave
+                # plenty of room; JSON mode stops it wrapping the answer in prose or markdown.
+                config=types.GenerateContentConfig(
+                    temperature=0.1, max_output_tokens=4096, response_mime_type="application/json"
+                ),
             )
         except errors.APIError as e:
             msg = f"{e.code} {e.message} {getattr(e, 'details', '')}"
@@ -166,6 +195,7 @@ _KINDS = {"gemini": _GeminiProvider, "openai_compatible": _OpenAICompatibleProvi
 class LLMClient:
     MAX_ATTEMPTS_PER_PROVIDER = 3
     MAX_CONSECUTIVE_FAILURES = 5
+    OVERLOAD_RETRIES_BEFORE_HANDOFF = 1
 
     def __init__(self, provider_specs: list[dict] | None = None):
         self.providers: list[_Provider] = []
@@ -194,38 +224,46 @@ class LLMClient:
         usable = [p for p in self.providers if not p.disabled_reason and not (skip and p.label in skip)]
         for idx, p in enumerate(usable):
             has_fallback = any(not q.disabled_reason for q in usable[idx + 1:])
+            overloads = generic_failures = 0
             for attempt in range(1, self.MAX_ATTEMPTS_PER_PROVIDER + 1):
                 if p.disabled_reason:
                     break
+                p.wait_for_cooldown()
                 p.limiter.acquire(tokens)
                 try:
                     text = p.complete(prompt)
                     with self._count_lock:
                         self.calls_made += 1  # only successful calls count towards the run budget
-                    p.consecutive_failures = 0
+                    p.note_success()
                     return text, p.label
                 except _QuotaExhausted as e:
                     p.disabled_reason = str(e)[:200]
                     logger.warning("AI provider %s benched for this run: %s", p.label, p.disabled_reason)
                     break
                 except _Overloaded as e:
-                    if has_fallback:
-                        logger.info("%s overloaded (%s); handing this post to the next provider", p.label, e)
+                    overloads += 1
+                    pause = p.note_overload()
+                    # Retry the primary once before spending a fallback's (smaller) daily quota.
+                    if has_fallback and overloads > self.OVERLOAD_RETRIES_BEFORE_HANDOFF:
+                        logger.info("%s still overloaded; handing this post to the next provider", p.label)
                         break
-                    wait = 10 * 2 ** (attempt - 1)
-                    logger.warning("%s overloaded; retrying in %ds (attempt %d)", p.label, wait, attempt)
-                    time.sleep(wait)
+                    logger.warning("%s overloaded (%s); pausing it %.0fs (attempt %d)", p.label, str(e)[:60],
+                                   pause, attempt)
                 except _RateLimited as e:
                     wait = min(e.wait + 1, 120)
                     logger.warning("%s rate-limited; waiting %.0fs (attempt %d)", p.label, wait, attempt)
                     time.sleep(wait)
                 except Exception as e:
+                    generic_failures += 1
                     wait = 5 * 2 ** (attempt - 1)
                     logger.warning("%s call failed (%s); retrying in %ds (attempt %d)", p.label, e, wait, attempt)
                     time.sleep(wait)
-            else:
-                p.consecutive_failures += 1
-                if p.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+            # Bench only for repeated *real* errors, never for temporary overload.
+            if generic_failures >= self.MAX_ATTEMPTS_PER_PROVIDER:
+                with p._state_lock:
+                    p.consecutive_failures += 1
+                    bench = p.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES
+                if bench:
                     p.disabled_reason = "too many consecutive failures"
                     logger.warning("AI provider %s benched: %s", p.label, p.disabled_reason)
         raise TemporaryAIError("All AI providers failed or are out of quota")
