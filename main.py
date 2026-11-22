@@ -57,6 +57,19 @@ def _date_only(ts: str | None) -> date | None:
 # ---------------------------------------------------------------------------
 # Decision logic for one opportunity (pure apart from the AI call; easy to test)
 # ---------------------------------------------------------------------------
+def prefilter(opp: dict) -> str | None:
+    """Free checks that need no AI. Returns a final status, or None if the AI must decide."""
+    title, text = opp.get("title") or "", opp.get("full_text") or ""
+    if len(text) < 200:
+        logger.info("SKIP (no content): %s", title[:70])
+        return "processed_irrelevant"
+    expired_on = is_clearly_expired(text)
+    if expired_on:
+        logger.info("SKIP (deadline %s passed, no AI used): %s", expired_on, title[:70])
+        return "processed_expired"
+    return None
+
+
 def evaluate(opp: dict, llm: LLMClient) -> tuple[str, dict | None]:
     """
     Returns (status, final_record_or_None).
@@ -65,14 +78,9 @@ def evaluate(opp: dict, llm: LLMClient) -> tuple[str, dict | None]:
     title, text = opp.get("title") or "", opp.get("full_text") or ""
     published = _date_only(opp.get("published_at") or opp.get("scraped_at"))
 
-    if len(text) < 200:
-        logger.info("SKIP (no content): %s", title[:70])
-        return "processed_irrelevant", None
-
-    expired_on = is_clearly_expired(text)
-    if expired_on:
-        logger.info("SKIP (deadline %s passed, no AI used): %s", expired_on, title[:70])
-        return "processed_expired", None
+    status = prefilter(opp)
+    if status:
+        return status, None
 
     try:
         result, model = analyze(llm, title, text, published.isoformat() if published else None)
@@ -146,6 +154,22 @@ def run_processor(llm: LLMClient, max_ai_calls: int, items: list[dict] | None = 
 
     deadline_ts = time.monotonic() + config.MAX_PROCESSOR_MINUTES * 60
     stats, buffer = {}, []
+
+    # Pass 1 (free): settle everything the pre-filter can decide, whatever happens with the AI later.
+    needs_ai = []
+    for opp in pending:
+        status = prefilter(opp)
+        if status is None:
+            needs_ai.append(opp)
+            continue
+        stats[status] = stats.get(status, 0) + 1
+        buffer.append({"link": opp["link"], "status": status})
+    if not dry_run:
+        for i in range(0, len(buffer), 200):
+            db.bulk_update_statuses(buffer[i:i + 200])
+    buffer.clear()
+    logger.info("Pre-filter settled %d posts without AI; %d need AI", len(pending) - len(needs_ai), len(needs_ai))
+    pending = needs_ai
     gate = threading.Lock()
     in_flight = 0
 
