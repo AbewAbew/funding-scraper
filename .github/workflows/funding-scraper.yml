@@ -2,7 +2,8 @@ name: Funding Scraper
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # daily, 06:00 UTC (09:00 Addis Ababa)
+    # Off the top of the hour: GitHub delays/drops many runs scheduled at :00 under load.
+    - cron: '17 6 * * *'  # daily, 06:17 UTC (09:17 Addis Ababa)
   workflow_dispatch:
     inputs:
       stages:
